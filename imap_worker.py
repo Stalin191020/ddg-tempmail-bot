@@ -9,6 +9,7 @@ from email.header import decode_header
 from datetime import datetime, timedelta
 from typing import List, Dict, Set, Optional
 from bs4 import BeautifulSoup
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton, CopyTextButton
 from telegram.constants import ParseMode
 from telegram.ext import Application
 from database import Database
@@ -182,9 +183,10 @@ async def run_imap_background_loop(app: Application, db: Database):
                     )
                     target_user_id = alias_map.get(item["alias"])
                     if inserted and target_user_id:
+                        otp_code = item["otp"]
                         otp_line = (
-                            f"🔑 <b>OTP / Code:</b> <code>{html.escape(item['otp'])}</code>\n"
-                            if item["otp"]
+                            f"🔑 <b>OTP / Code:</b> <code>{html.escape(otp_code)}</code>\n"
+                            if otp_code
                             else ""
                         )
                         text = (
@@ -193,13 +195,28 @@ async def run_imap_background_loop(app: Application, db: Database):
                             f"👤 <b>From:</b> {html.escape(item['sender'][:50])}\n"
                             f"📝 <b>Subject:</b> {html.escape(item['subject'][:80])}\n"
                             f"{otp_line}"
-                            f"💬 <b>Message:</b>\n<pre>{html.escape(item['body'][:450])}</pre>"
+                            f"💬 <b>Message:</b>\n<blockquote>{html.escape(item['body'][:450])}</blockquote>"
+                        )
+                        reply_markup = (
+                            InlineKeyboardMarkup(
+                                [
+                                    [
+                                        InlineKeyboardButton(
+                                            f"📋 Copy OTP ({otp_code})",
+                                            copy_text=CopyTextButton(text=otp_code),
+                                        )
+                                    ]
+                                ]
+                            )
+                            if otp_code
+                            else None
                         )
                         asyncio.create_task(
                             app.bot.send_message(
                                 chat_id=target_user_id,
                                 text=text,
                                 parse_mode=ParseMode.HTML,
+                                reply_markup=reply_markup,
                             )
                         )
 
