@@ -4,50 +4,59 @@ import httpx
 from typing import Dict
 
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
-AI_BASE_URL = os.getenv(
-    "AI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai"
-).rstrip("/")
-AI_MODEL = os.getenv("AI_MODEL", "gemini-2.5-flash").strip()
 
 
 class UniversalAIClient:
     def __init__(self):
         self.http = httpx.AsyncClient(timeout=20.0)
+        self.cached_model = ""
 
     @property
     def is_enabled(self) -> bool:
         return bool(AI_API_KEY)
 
+    async def _resolve_gemini_model(self) -> str:
+        if self.cached_model:
+            return self.cached_model
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={AI_API_KEY}"
+        try:
+            resp = await self.http.get(url)
+            if resp.status_code == 200:
+                models = resp.json().get("models", [])
+                for m in models:
+                    name = m.get("name", "").replace("models/", "")
+                    methods = m.get("supportedGenerationMethods", [])
+                    if "flash" in name and "generateContent" in methods:
+                        self.cached_model = name
+                        print(f"[AI Auto-Selected Model] {name}")
+                        return name
+        except Exception as e:
+            print(f"[AI Model Discovery Error] {e}")
+        return "gemini-1.5-flash"
+
     async def _chat(self, system_prompt: str, user_prompt: str, max_tokens: int = 500) -> str:
         if not self.is_enabled:
-            print("[AI Helper] AI_API_KEY is empty!")
             return ""
 
-        url = f"{AI_BASE_URL}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {AI_API_KEY}",
-            "Content-Type": "application/json",
-        }
+        model = await self._resolve_gemini_model()
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={AI_API_KEY}"
         payload = {
-            "model": AI_MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.2,
-            "max_tokens": max_tokens,
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens},
         }
 
         try:
-            resp = await self.http.post(url, headers=headers, json=payload)
+            resp = await self.http.post(url, json=payload)
             if resp.status_code == 200:
                 data = resp.json()
-                content = data["choices"][0]["message"].get("content") or ""
-                return content.strip()
+                parts = data["candidates"][0]["content"]["parts"]
+                return "".join(p.get("text", "") for p in parts).strip()
             else:
-                print(f"[AI API Error {resp.status_code}] {resp.text[:300]}")
+                self.cached_model = ""
+                print(f"[AI Error {resp.status_code}] {resp.text[:250]}")
         except Exception as exc:
-            print(f"[AI Helper Exception] {exc}")
+            print(f"[AI Exception] {exc}")
         return ""
 
     async def analyze_email(self, subject: str, body: str) -> Dict[str, str]:
@@ -56,40 +65,36 @@ class UniversalAIClient:
             return result
 
         sys_prompt = (
-            "You are an email security & OTP parser. Analyze the email and reply ONLY in valid JSON "
-            'with exact keys: {"otp": "", "summary": "", "warning": ""}.\n'
-            "- otp: exact verification code/OTP if present (do NOT extract numbers from URLs), else empty string.\n"
-            "- summary: max 15-word plain English summary of what this email is about.\n"
-            "- warning: short warning ONLY if it looks like a phishing/scam/fake KYC email, else empty string."
+            "You are an email security & OTP parser. Reply ONLY in valid JSON "
+            'with exact keys: {"otp": "", "summary": "", "warning": ""}. '
+            "otp: verification code if present (never extract numbers from URLs), else empty. "
+            "summary: max 15-word plain English summary. "
+            "warning: short phishing warning only if suspicious, else empty."
         )
-        user_prompt = f"Subject: {subject[:120]}\nBody:\n{body[:1200]}"
-
-        raw = await self._chat(sys_prompt, user_prompt, max_tokens=400)
+        raw = await self._chat(sys_prompt, f"Subject: {subject[:120]}\nBody:\n{body[:1200]}", 400)
         if not raw:
             return result
 
-        clean_json = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        clean = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         try:
-            parsed = json.loads(clean_json)
+            parsed = json.loads(clean)
             result["otp"] = str(parsed.get("otp", "")).strip()
             result["summary"] = str(parsed.get("summary", "")).strip()
             result["warning"] = str(parsed.get("warning", "")).strip()
-        except Exception as e:
-            print(f"[AI JSON Parse Warning] {e} | Raw: {raw[:200]}")
-
+        except Exception:
+            pass
         return result
 
     async def answer_support_query(self, user_question: str) -> str:
         if not self.is_enabled:
             return ""
-
         sys_prompt = (
             "You are the friendly support assistant for a Telegram Temp-Mail & OTP Bot. "
-            "Keep answers under 3 short lines in simple Hinglish/English. "
-            "Tell users to use '➕ New Email' to create an address and '📥 Check Inbox' to read OTPs. "
+            "Reply in under 3 short lines in simple Hinglish/English. "
+            "Guide users to use '➕ New Email' and '📥 Check Inbox'. "
             "Banking, crypto, and government accounts are strictly prohibited."
         )
-        return await self._chat(sys_prompt, user_question[:300], max_tokens=400)
+        return await self._chat(sys_prompt, user_question[:300], 400)
 
     async def close(self):
         await self.http.aclose()
