@@ -54,7 +54,7 @@ class UniversalAIClient:
     async def analyze_email(self, subject: str, body: str) -> Dict[str, str]:
         """
         Extracts hidden OTP/code, 1-line summary, and phishing risk flag in a single fast call.
-        Returns: {"otp": "...", "summary": "...", "warning": "..."}
+        Returns: {"otp": "", "summary": "", "warning": ""}
         """
         result = {"otp": "", "summary": "", "warning": ""}
         if not self.is_enabled:
@@ -73,7 +73,6 @@ class UniversalAIClient:
         if not raw:
             return result
 
-        # Strip markdown code fences if model wraps JSON
         clean_json = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         try:
             parsed = json.loads(clean_json)
@@ -93,7 +92,7 @@ class UniversalAIClient:
         sys_prompt = (
             "You are the friendly support assistant for a Telegram Temp-Mail & OTP Bot. "
             "Keep answers under 3 short lines in simple Hinglish/English. "
-            "Tell users to use '+ New Email' to create an address and 'Check Inbox' to read OTPs. "
+            "Tell users to use '➕ New Email' to create an address and '📥 Check Inbox' to read OTPs. "
             "Banking, crypto, and government accounts are strictly prohibited."
         )
         return await self._chat(sys_prompt, user_question[:300], max_tokens=140)
