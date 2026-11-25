@@ -5,26 +5,22 @@ from typing import Dict
 
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
 AI_BASE_URL = os.getenv(
-    "AI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"
+    "AI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai"
 ).rstrip("/")
 AI_MODEL = os.getenv("AI_MODEL", "gemini-2.5-flash").strip()
 
 
 class UniversalAIClient:
-    """
-    Provider-agnostic AI client using standard OpenAI-compatible Chat Completions.
-    Switch between Gemini, OpenRouter, Groq, or OpenAI just by changing Railway env vars.
-    """
-
     def __init__(self):
-        self.http = httpx.AsyncClient(timeout=12.0)
+        self.http = httpx.AsyncClient(timeout=20.0)
 
     @property
     def is_enabled(self) -> bool:
         return bool(AI_API_KEY)
 
-    async def _chat(self, system_prompt: str, user_prompt: str, max_tokens: int = 200) -> str:
+    async def _chat(self, system_prompt: str, user_prompt: str, max_tokens: int = 500) -> str:
         if not self.is_enabled:
+            print("[AI Helper] AI_API_KEY is empty!")
             return ""
 
         url = f"{AI_BASE_URL}/chat/completions"
@@ -38,7 +34,7 @@ class UniversalAIClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "temperature": 0.1,
+            "temperature": 0.2,
             "max_tokens": max_tokens,
         }
 
@@ -46,16 +42,15 @@ class UniversalAIClient:
             resp = await self.http.post(url, headers=headers, json=payload)
             if resp.status_code == 200:
                 data = resp.json()
-                return data["choices"][0]["message"]["content"].strip()
+                content = data["choices"][0]["message"].get("content") or ""
+                return content.strip()
+            else:
+                print(f"[AI API Error {resp.status_code}] {resp.text[:300]}")
         except Exception as exc:
-            print(f"[AI Helper Warning] {exc}")
+            print(f"[AI Helper Exception] {exc}")
         return ""
 
     async def analyze_email(self, subject: str, body: str) -> Dict[str, str]:
-        """
-        Extracts hidden OTP/code, 1-line summary, and phishing risk flag in a single fast call.
-        Returns: {"otp": "", "summary": "", "warning": ""}
-        """
         result = {"otp": "", "summary": "", "warning": ""}
         if not self.is_enabled:
             return result
@@ -63,13 +58,13 @@ class UniversalAIClient:
         sys_prompt = (
             "You are an email security & OTP parser. Analyze the email and reply ONLY in valid JSON "
             'with exact keys: {"otp": "", "summary": "", "warning": ""}.\n'
-            "- otp: exact verification code/OTP if present, else empty string.\n"
+            "- otp: exact verification code/OTP if present (do NOT extract numbers from URLs), else empty string.\n"
             "- summary: max 15-word plain English summary of what this email is about.\n"
             "- warning: short warning ONLY if it looks like a phishing/scam/fake KYC email, else empty string."
         )
         user_prompt = f"Subject: {subject[:120]}\nBody:\n{body[:1200]}"
 
-        raw = await self._chat(sys_prompt, user_prompt, max_tokens=160)
+        raw = await self._chat(sys_prompt, user_prompt, max_tokens=400)
         if not raw:
             return result
 
@@ -79,13 +74,12 @@ class UniversalAIClient:
             result["otp"] = str(parsed.get("otp", "")).strip()
             result["summary"] = str(parsed.get("summary", "")).strip()
             result["warning"] = str(parsed.get("warning", "")).strip()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[AI JSON Parse Warning] {e} | Raw: {raw[:200]}")
 
         return result
 
     async def answer_support_query(self, user_question: str) -> str:
-        """Handles general user questions cleanly when user types free text in bot."""
         if not self.is_enabled:
             return ""
 
@@ -95,7 +89,7 @@ class UniversalAIClient:
             "Tell users to use '➕ New Email' to create an address and '📥 Check Inbox' to read OTPs. "
             "Banking, crypto, and government accounts are strictly prohibited."
         )
-        return await self._chat(sys_prompt, user_question[:300], max_tokens=140)
+        return await self._chat(sys_prompt, user_question[:300], max_tokens=400)
 
     async def close(self):
         await self.http.aclose()
