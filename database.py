@@ -12,11 +12,10 @@ class Database:
         self.conn = await aiosqlite.connect(self.db_path, timeout=30.0)
         self.conn.row_factory = aiosqlite.Row
 
-        # High-concurrency SQLite optimizations for 500+ concurrent users
         await self.conn.execute("PRAGMA journal_mode=WAL;")
         await self.conn.execute("PRAGMA synchronous=NORMAL;")
         await self.conn.execute("PRAGMA busy_timeout=5000;")
-        await self.conn.execute("PRAGMA cache_size=-32000;")  # 32MB RAM cache
+        await self.conn.execute("PRAGMA cache_size=-32000;")
 
         await self.conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -24,9 +23,21 @@ class Database:
                 username TEXT,
                 max_slots INTEGER DEFAULT 3,
                 plan_expiry REAL DEFAULT NULL,
+                agreed INTEGER DEFAULT 0,
+                is_banned INTEGER DEFAULT 0,
                 created_at REAL
             )
         """)
+
+        for col_sql in [
+            "ALTER TABLE users ADD COLUMN agreed INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0",
+        ]:
+            try:
+                await self.conn.execute(col_sql)
+            except Exception:
+                pass
+
         await self.conn.execute("""
             CREATE TABLE IF NOT EXISTS active_emails (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,6 +63,7 @@ class Database:
                 is_valid INTEGER DEFAULT 1
             )
         """)
+
         await self.conn.execute("""
             CREATE TABLE IF NOT EXISTS inbox_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,6 +79,19 @@ class Database:
         await self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_inbox_alias ON inbox_messages(alias, received_at DESC);"
         )
+
+        await self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                event_type TEXT NOT NULL,
+                alias_email TEXT,
+                details TEXT,
+                created_at REAL NOT NULL
+            )
+        """)
+
         await self.conn.commit()
 
     async def close(self):
@@ -76,11 +101,57 @@ class Database:
     async def register_user(self, user_id: int, username: Optional[str]):
         await self.conn.execute(
             """
-            INSERT INTO users (user_id, username, max_slots, created_at)
-            VALUES (?, ?, 3, ?)
+            INSERT INTO users (user_id, username, max_slots, agreed, is_banned, created_at)
+            VALUES (?, ?, 3, 0, 0, ?)
             ON CONFLICT(user_id) DO UPDATE SET username = excluded.username
             """,
             (user_id, username or "", time.time()),
+        )
+        await self.conn.commit()
+
+    async def get_security_status(self, user_id: int) -> Tuple[bool, bool]:
+        """Returns (has_agreed, is_banned)."""
+        cursor = await self.conn.execute(
+            "SELECT agreed, is_banned FROM users WHERE user_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return False, False
+        return bool(row["agreed"]), bool(row["is_banned"])
+
+    async def set_user_agreed(self, user_id: int, username: Optional[str] = ""):
+        await self.register_user(user_id, username)
+        await self.conn.execute(
+            "UPDATE users SET agreed = 1 WHERE user_id = ?", (user_id,)
+        )
+        await self.conn.commit()
+
+    async def set_ban_status(self, user_id: int, banned: bool):
+        await self.register_user(user_id, "")
+        await self.conn.execute(
+            "UPDATE users SET is_banned = ? WHERE user_id = ?",
+            (1 if banned else 0, user_id),
+        )
+        if banned:
+            await self.conn.execute(
+                "DELETE FROM active_emails WHERE user_id = ?", (user_id,)
+            )
+        await self.conn.commit()
+
+    async def log_audit_event(
+        self,
+        user_id: int,
+        username: str,
+        event_type: str,
+        alias_email: str = "",
+        details: str = "",
+    ):
+        await self.conn.execute(
+            """
+            INSERT INTO audit_logs (user_id, username, event_type, alias_email, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, username, event_type, alias_email.lower(), details, time.time()),
         )
         await self.conn.commit()
 
@@ -142,6 +213,12 @@ class Database:
         )
         await self.conn.commit()
 
+    async def email_exists(self, email: str) -> bool:
+        c = await self.conn.execute(
+            "SELECT 1 FROM active_emails WHERE email = ?", (email.lower(),)
+        )
+        return (await c.fetchone()) is not None
+
     async def get_user_emails(self, user_id: int) -> List[Dict]:
         cursor = await self.conn.execute(
             """
@@ -155,7 +232,6 @@ class Database:
         return [dict(r) for r in await cursor.fetchall()]
 
     async def get_all_active_alias_map(self) -> Dict[str, int]:
-        """Returns {email: user_id} map for fast background IMAP routing."""
         cursor = await self.conn.execute("SELECT email, user_id FROM active_emails")
         return {r["email"]: r["user_id"] for r in await cursor.fetchall()}
 
@@ -174,7 +250,6 @@ class Database:
         )
         await self.conn.commit()
 
-    # --- Cached Inbox Messages ---
     async def save_inbox_message(
         self, msg_uid: str, alias: str, sender: str, subject: str, otp: str, body: str
     ) -> bool:
@@ -189,7 +264,7 @@ class Database:
         await self.conn.commit()
         return cursor.rowcount > 0
 
-    async def get_messages_for_aliases(self, aliases: List[str], limit: int = 8) -> List[Dict]:
+    async def get_messages_for_aliases(self, aliases: List[str], limit: int = 5) -> List[Dict]:
         if not aliases:
             return []
         placeholders = ",".join("?" for _ in aliases)
@@ -206,10 +281,11 @@ class Database:
 
     async def purge_old_messages(self, max_age_seconds: int = 86400):
         cutoff = time.time() - max_age_seconds
-        await self.conn.execute("DELETE FROM inbox_messages WHERE received_at < ?", (cutoff,))
+        await self.conn.execute(
+            "DELETE FROM inbox_messages WHERE received_at < ?", (cutoff,)
+        )
         await self.conn.commit()
 
-    # --- Token Pool Persistence ---
     async def upsert_token(self, token_id: str, bearer_token: str):
         await self.conn.execute(
             """
@@ -250,4 +326,12 @@ class Database:
         (emails,) = await (
             await self.conn.execute("SELECT COUNT(*) FROM active_emails")
         ).fetchone()
-        return {"users": users, "premium_users": prem, "active_emails": emails}
+        (banned,) = await (
+            await self.conn.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1")
+        ).fetchone()
+        return {
+            "users": users,
+            "premium_users": prem,
+            "active_emails": emails,
+            "banned_users": banned,
+        }
