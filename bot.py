@@ -2,15 +2,15 @@ import os
 import html
 import time
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional
 from dotenv import load_dotenv
-
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    CopyTextButton,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -26,6 +26,7 @@ from telegram.ext import (
 from database import Database
 from ddg_client import DuckAliasClient
 from imap_worker import run_imap_background_loop
+from ai_helper import UniversalAIClient
 
 load_dotenv()
 
@@ -35,22 +36,34 @@ ADMIN_IDS = {
 }
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@Admin")
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "").strip()
+IST = timezone(timedelta(hours=5, minutes=30))
 
 db = Database(DB_PATH)
 ddg = DuckAliasClient(db)
+ai_client = UniversalAIClient()
 
 user_locks: Dict[int, asyncio.Lock] = {}
 imap_task: Optional[asyncio.Task] = None
-
 PAGE_SIZE = 5
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["➕ New Email", "📧 Active Mails"],
-        ["🔄 Check Inbox", "🗑️ Delete Email"],
+        ["📥 Check Inbox", "🗑️ Delete Email"],
         ["💎 Subscription"],
     ],
     resize_keyboard=True,
+)
+
+TERMS_TEXT = (
+    "🛡️ <b>Terms of Use & Privacy Notice</b>\n\n"
+    "Welcome! Before generating temporary emails, please review our policy:\n"
+    "• <b>Purpose:</b> Strictly for personal privacy & app/website testing.\n"
+    "• <b>Prohibited Use:</b> Banking, financial wallets, crypto, government portals, or any illegal activity is strictly forbidden.\n"
+    "• <b>Receive-Only:</b> Outgoing emails are disabled.\n"
+    "• <b>Security Compliance:</b> User IDs and alias timestamps are logged.\n\n"
+    "Tap <b>✅ I Agree & Continue</b> below to unlock the bot."
 )
 
 
@@ -71,72 +84,180 @@ def time_ago(ts: float) -> str:
     return f"{diff // 86400}d ago"
 
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await db.register_user(user.id, user.username)
-    active, max_slots, _ = await db.get_user_quota(user.id)
+async def send_audit_channel(bot, text: str):
+    if not LOG_CHANNEL_ID:
+        return
+    try:
+        await bot.send_message(
+            chat_id=int(LOG_CHANNEL_ID),
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        print(f"[Log Channel Error] {e}")
 
+
+async def check_user_gate(update: Update) -> bool:
+    """Enforces ban check and Terms agreement gate."""
+    user = update.effective_user
+    if not user:
+        return False
+    await db.register_user(user.id, user.username)
+    agreed, banned = await db.get_security_status(user.id)
+
+    if banned:
+        if update.message:
+            await update.message.reply_text(
+                "🚫 <b>Access Suspended</b>\nYour account has been banned for violating our Terms of Use.",
+                parse_mode=ParseMode.HTML,
+            )
+        return False
+
+    if not agreed:
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✅ I Agree & Continue", callback_data="accept_terms")]]
+        )
+        if update.message:
+            await update.message.reply_text(
+                TERMS_TEXT, parse_mode=ParseMode.HTML, reply_markup=kb
+            )
+        return False
+
+    return True
+
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user_gate(update):
+        return
+    user = update.effective_user
+    active, max_slots, _ = await db.get_user_quota(user.id)
     text = (
         f"👋 <b>Welcome, {html.escape(user.first_name)}!</b>\n\n"
-        "Generate private <code>@duck.com</code> temporary emails. "
-        "OTPs are pushed automatically and available anytime via <b>Check Inbox</b>.\n\n"
+        "Generate instant temporary emails (<code>@duck.com</code> & <code>@gmail.com</code>).\n"
+        "OTPs arrive automatically here or via <b>📥 Check Inbox</b>.\n\n"
         f"📊 <b>Your Active Slots:</b> <code>{active}/{max_slots}</code>"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MAIN_KEYBOARD)
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.HTML, reply_markup=MAIN_KEYBOARD
+    )
 
 
-# --- 1. New Email (3-Slot Free Limit + Up to 50 Subscription) ---
+# --- 1. New Email (Provider Choice: DDG vs Gmail Alias) ---
 async def handle_new_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user_gate(update):
+        return
     user_id = update.effective_user.id
-    await db.register_user(user_id, update.effective_user.username)
+    active, max_slots, _ = await db.get_user_quota(user_id)
+
+    if active >= max_slots:
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🗑️ Delete an Old Email", callback_data="menu_del:0")],
+                [InlineKeyboardButton("💎 Upgrade Limit (Up to 50)", callback_data="menu_sub")],
+            ]
+        )
+        await update.message.reply_text(
+            f"⚠️ <b>Slot Limit Reached ({active}/{max_slots})</b>\n\n"
+            "Delete one of your active addresses first to generate a new email, "
+            "or upgrade your plan (up to <b>50 active emails</b>).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
+        return
+
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🦆 @duck.com (Anonymous)", callback_data="gen:ddg"),
+                InlineKeyboardButton("📧 @gmail.com (High Accept)", callback_data="gen:gmail"),
+            ]
+        ]
+    )
+    await update.message.reply_text(
+        "✨ <b>Choose Email Provider:</b>\n\n"
+        "• <b>🦆 @duck.com:</b> 100% random anonymous address.\n"
+        "• <b>📧 @gmail.com:</b> Real Gmail alias (accepted everywhere).",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+
+async def create_alias_for_user(query, context: ContextTypes.DEFAULT_TYPE, provider: str):
+    user = query.from_user
+    user_id = user.id
+    agreed, banned = await db.get_security_status(user_id)
+    if banned or not agreed:
+        await query.edit_message_text("⚠️ Please send /start and accept the Terms first.")
+        return
 
     async with get_lock(user_id):
         active, max_slots, _ = await db.get_user_quota(user_id)
-
         if active >= max_slots:
-            kb = InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("🗑️ Delete an Old Email", callback_data="menu_del:0")],
-                    [InlineKeyboardButton("💎 Upgrade Limit (Up to 50)", callback_data="menu_sub")],
-                ]
-            )
-            await update.message.reply_text(
-                f"⚠️ <b>Slot Limit Reached ({active}/{max_slots})</b>\n\n"
-                "Delete one of your active addresses first to generate a new email, "
-                "or upgrade your plan (up to <b>50 active emails</b>).",
+            await query.edit_message_text(
+                f"⚠️ <b>Slot Limit Reached ({active}/{max_slots})</b>\nDelete an old email first.",
                 parse_mode=ParseMode.HTML,
-                reply_markup=kb,
             )
             return
 
-        wait_msg = await update.message.reply_text("⏳ Generating new DuckDuckGo address...")
-        try:
-            res = await ddg.generate_alias()
-            await db.add_email(user_id, res["email"], res["alias_id"], res["token_id"])
-            new_active = active + 1
+        label = "DuckDuckGo" if provider == "ddg" else "Gmail Alias"
+        await query.edit_message_text(
+            f"⏳ Generating new <b>{label}</b> address...", parse_mode=ParseMode.HTML
+        )
 
+        try:
+            if provider == "gmail":
+                res = await ddg.generate_gmail_alias()
+            else:
+                res = await ddg.generate_alias()
+
+            await db.add_email(user_id, res["email"], res["alias_id"], res["token_id"])
+            uname = f"@{user.username}" if user.username else "NoUsername"
+            await db.log_audit_event(user_id, uname, "NEW_ALIAS", res["email"], provider)
+
+            now_ist = datetime.now(IST).strftime("%d-%b-%Y %I:%M:%S %p IST")
+            asyncio.create_task(
+                send_audit_channel(
+                    context.bot,
+                    f"🆕 #NEW_ALIAS | #ID_{user_id}\n"
+                    f"👤 <b>User:</b> {html.escape(user.first_name)} ({uname})\n"
+                    f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
+                    f"📧 <b>Alias:</b> <code>{html.escape(res['email'])}</code>\n"
+                    f"🕒 <b>Time:</b> {now_ist}",
+                )
+            )
+
+            new_active = active + 1
             kb = InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("🔄 Check Inbox / OTP", callback_data="refresh_all")],
-                    [InlineKeyboardButton("📧 View All Active Mails", callback_data="menu_active:0")],
+                    [
+                        InlineKeyboardButton(
+                            "📋 Copy Email",
+                            copy_text=CopyTextButton(text=res["email"]),
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton("📥 Check Inbox", callback_data="refresh_all"),
+                        InlineKeyboardButton("📧 Active Mails", callback_data="menu_active:0"),
+                    ],
                 ]
             )
-            await wait_msg.edit_text(
+            await query.edit_message_text(
                 "✅ <b>New Temp Email Created!</b>\n\n"
-                f"📧 <code>{html.escape(res['email'])}</code> <i>(Tap to copy)</i>\n"
+                f"📧 <code>{html.escape(res['email'])}</code>\n"
                 f"📊 <b>Slots Used:</b> <code>{new_active}/{max_slots}</code>\n\n"
-                "OTPs will arrive automatically here or via <b>Check Inbox</b>.",
+                "OTPs will arrive automatically here or via <b>📥 Check Inbox</b>.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb,
             )
         except Exception as exc:
-            await wait_msg.edit_text(
+            await query.edit_message_text(
                 f"❌ <b>Failed to generate email:</b>\n<code>{html.escape(str(exc))}</code>",
                 parse_mode=ParseMode.HTML,
             )
 
 
-# --- 2. Know Active Emails (Paginated for up to 50 slots) ---
+# --- 2. Active Emails (Paginated) ---
 async def render_active_mails(user_id: int, page: int = 0):
     active, max_slots, expiry = await db.get_user_quota(user_id)
     emails = await db.get_user_emails(user_id)
@@ -188,52 +309,54 @@ async def render_active_mails(user_id: int, page: int = 0):
 
 
 async def handle_active_mails(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user_gate(update):
+        return
     text, kb = await render_active_mails(update.effective_user.id, page=0)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
-# --- 3. Check SMS / Inbox (Instant DB Cache Read — Zero IMAP Bottleneck) ---
+# --- 3. Check Inbox ---
 async def format_cached_inbox(target_aliases: list[str]) -> str:
     messages = await db.get_messages_for_aliases(target_aliases, limit=5)
     if not messages:
         return (
             "📭 <b>No new emails or OTPs found yet.</b>\n\n"
-            "• Inbox updates automatically every 8 seconds.\n"
-            "• Wait a few seconds after requesting your OTP and tap <b>🔄 Refresh</b>."
+            "• Inbox updates automatically every few seconds.\n"
+            "• Wait 5–10 seconds after requesting your OTP and tap <b>🔄 Refresh</b>."
         )
 
     blocks = ["📬 <b>Latest Received Messages:</b>\n"]
     for m in messages:
         otp_line = f"🔑 <b>OTP / Code:</b> <code>{html.escape(m['otp'])}</code>\n" if m["otp"] else ""
         blocks.append(
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"📧 <b>To:</b> <code>{html.escape(m['alias'])}</code> ({time_ago(m['received_at'])})\n"
-            f"👤 <b>From:</b> {html.escape(m['sender'][:50])}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📥 <b>To:</b> <code>{html.escape(m['alias'])}</code> ({time_ago(m['received_at'])})\n"
+            f"📤 <b>From:</b> {html.escape(m['sender'][:50])}\n"
             f"📝 <b>Subject:</b> {html.escape(m['subject'][:80])}\n"
             f"{otp_line}"
-            f"💬 <b>Message:</b>\n<pre>{html.escape(m['body'][:420])}</pre>"
+            f"💬 <b>Message:</b>\n<pre>{html.escape(m['body'][:400])}</pre>"
         )
     return "\n".join(blocks)
 
 
 async def handle_check_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user_gate(update):
+        return
     user_id = update.effective_user.id
     emails = await db.get_user_emails(user_id)
     if not emails:
         await update.message.reply_text(
-            "📭 You have no active emails. Tap <b>➕ New Email</b> first.",
+            "You have no active emails. Tap <b>➕ New Email</b> first.",
             parse_mode=ParseMode.HTML,
         )
         return
 
     res_text = await format_cached_inbox([e["email"] for e in emails])
-    kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🔄 Refresh Again", callback_data="refresh_all")]]
-    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh Again", callback_data="refresh_all")]])
     await update.message.reply_text(res_text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
-# --- 4. Delete Current Email (Selective Delete + Slot Free) ---
+# --- 4. Delete Email ---
 async def render_delete_menu(user_id: int, page: int = 0):
     emails = await db.get_user_emails(user_id)
     if not emails:
@@ -257,22 +380,26 @@ async def render_delete_menu(user_id: int, page: int = 0):
 
     text = (
         "🗑️ <b>Delete Active Email</b>\n\n"
-        "Choose which email address you want to cancel to free up a slot:"
+        "Choose which email address you want to deactivate to free up a slot:"
     )
     return text, InlineKeyboardMarkup(buttons)
 
 
 async def handle_delete_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user_gate(update):
+        return
     text, kb = await render_delete_menu(update.effective_user.id, page=0)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 # --- 5. Subscription Info ---
 async def handle_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user_gate(update):
+        return
     user_id = update.effective_user.id
     active, max_slots, _ = await db.get_user_quota(user_id)
     text = (
-        "💎 <b>Subscription Plans (3+ up to 50 Slots)</b>\n\n"
+        "💎 <b>Subscription Plans (3 up to 50 Slots)</b>\n\n"
         f"📊 <b>Current Quota:</b> <code>{active}/{max_slots}</code> active emails\n"
         f"🆔 <b>Your User ID:</b> <code>{user_id}</code>\n\n"
         "• <b>Free:</b> 3 active emails\n"
@@ -288,10 +415,28 @@ async def handle_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
+    user = query.from_user
+    user_id = user.id
     data = query.data or ""
 
-    if data.startswith("menu_active:"):
+    if data == "accept_terms":
+        await db.set_user_agreed(user_id, user.username)
+        await query.edit_message_text(
+            "✅ <b>Terms Accepted!</b>\nYou can now generate temporary emails using the menu below.",
+            parse_mode=ParseMode.HTML,
+        )
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="👇 Choose an option from the keyboard:",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    if data.startswith("gen:"):
+        provider = data.split(":", 1)[1]
+        await create_alias_for_user(query, context, provider)
+
+    elif data.startswith("menu_active:"):
         page = int(data.split(":")[1])
         text, kb = await render_active_mails(user_id, page)
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -304,7 +449,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "menu_sub":
         active, max_slots, _ = await db.get_user_quota(user_id)
         await query.edit_message_text(
-            "💎 <b>Subscription Plans (3+ up to 50 Slots)</b>\n\n"
+            "💎 <b>Subscription Plans (3 up to 50 Slots)</b>\n\n"
             f"📊 <b>Current Quota:</b> <code>{active}/{max_slots}</code>\n"
             f"🆔 <b>Your User ID:</b> <code>{user_id}</code>\n\n"
             "• <b>Basic:</b> 10 active emails\n"
@@ -320,13 +465,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("📭 No active emails found.")
             return
         res_text = await format_cached_inbox([e["email"] for e in emails])
-        kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔄 Refresh Again", callback_data="refresh_all")]]
-        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh Again", callback_data="refresh_all")]])
         try:
             await query.edit_message_text(res_text, parse_mode=ParseMode.HTML, reply_markup=kb)
         except Exception:
-            pass  # Ignore "Message is not modified" if user clicks rapidly
+            pass
 
     elif data.startswith("check_one:"):
         row_id = int(data.split(":")[1])
@@ -351,7 +494,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row_id = int(data.split(":")[1])
         item = await db.get_email_by_id(row_id, user_id)
         if not item:
-            await query.edit_message_text("⚠️ Email already deleted.")
+            await query.edit_message_text("📭 Email already deleted.")
             return
         kb = InlineKeyboardMarkup(
             [
@@ -373,13 +516,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row_id = int(data.split(":")[1])
         item = await db.get_email_by_id(row_id, user_id)
         if not item:
-            await query.edit_message_text("⚠️ Email already deleted.")
+            await query.edit_message_text("📭 Email already deleted.")
             return
-
         await ddg.delete_alias(item["alias_id"], item["token_id"])
         await db.delete_email_record(row_id, user_id)
         active, max_slots, _ = await db.get_user_quota(user_id)
-
         await query.edit_message_text(
             f"✅ <b>Deleted:</b> <code>{html.escape(item['email'])}</code>\n"
             f"📊 <b>Slots Used:</b> <code>{active}/{max_slots}</code>",
@@ -389,110 +530,4 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Admin Commands ---
 async def addprem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS or len(context.args) != 3:
-        return
-    target_id, slots, days = int(context.args[0]), int(context.args[1]), int(context.args[2])
-    await db.set_subscription(target_id, slots, days)
-    await update.message.reply_text(
-        f"✅ User <code>{target_id}</code> upgraded to <b>{min(50, max(3, slots))} slots</b> for <b>{days} days</b>.",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def removeprem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS or len(context.args) != 1:
-        return
-    target_id = int(context.args[0])
-    await db.remove_subscription(target_id)
-    await update.message.reply_text(
-        f"✅ User <code>{target_id}</code> reset to <b>3 free slots</b>.",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS or len(context.args) != 2:
-        return
-    await db.upsert_token(context.args[0], context.args[1])
-    await update.message.reply_text(
-        f"✅ Token <code>{html.escape(context.args[0])}</code> added.", parse_mode=ParseMode.HTML
-    )
-
-
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-    stats = await db.get_global_stats()
-    tokens = await db.get_all_tokens()
-    now = time.time()
-    active_toks = sum(1 for t in tokens if t["is_valid"] == 1 and t["exhausted_until"] <= now)
-    await update.message.reply_text(
-        "📊 <b>Bot Statistics</b>\n\n"
-        f"• Total Users: <b>{stats['users']}</b>\n"
-        f"• Premium Users: <b>{stats['premium_users']}</b>\n"
-        f"• Active Emails: <b>{stats['active_emails']}</b>\n"
-        f"• Healthy DDG Tokens: <b>{active_toks}/{len(tokens)}</b>",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.message.text or "").strip()
-    if txt == "➕ New Email":
-        await handle_new_email(update, context)
-    elif txt == "📧 Active Mails":
-        await handle_active_mails(update, context)
-    elif txt == "🔄 Check Inbox":
-        await handle_check_inbox(update, context)
-    elif txt == "🗑️ Delete Email":
-        await handle_delete_menu(update, context)
-    elif txt == "💎 Subscription":
-        await handle_subscription(update, context)
-
-
-async def post_init(application: Application):
-    global imap_task
-    await db.init_db()
-    raw_tokens = os.getenv("DDG_TOKENS", "")
-    for pair in raw_tokens.split(","):
-        if ":" in pair:
-            name, tok = pair.split(":", 1)
-            if name.strip() and tok.strip():
-                await db.upsert_token(name.strip(), tok.strip())
-
-    # Start single persistent background IMAP worker
-    imap_task = asyncio.create_task(run_imap_background_loop(application, db))
-
-
-async def post_shutdown(application: Application):
-    if imap_task:
-        imap_task.cancel()
-    await ddg.http.aclose()
-    await db.close()
-
-
-def main():
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .concurrent_updates(256)  # Handle 500+ concurrent users without queueing
-        .rate_limiter(AIORateLimiter(max_retries=3))  # Prevent Telegram 429 flood errors
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
-
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("addprem", addprem_cmd))
-    app.add_handler(CommandHandler("removeprem", removeprem_cmd))
-    app.add_handler(CommandHandler("addtoken", addtoken_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-
-    print("High-Concurrency Bot (500+ users ready) is running...")
-    app.run_polling(drop_pending_updates=True)
-
-
-if __name__ == "__main__":
-    main()
+    if update.effective_user.id not in ADMIN_IDS or l
