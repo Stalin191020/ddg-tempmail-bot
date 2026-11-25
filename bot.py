@@ -313,3 +313,374 @@ async def handle_active_mails(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     text, kb = await render_active_mails(update.effective_user.id, page=0)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+# --- 3. Check Inbox ---
+async def format_cached_inbox(target_aliases: list[str]) -> str:
+    messages = await db.get_messages_for_aliases(target_aliases, limit=5)
+    if not messages:
+        return (
+            "📭 <b>No new emails or OTPs found yet.</b>\n\n"
+            "• Inbox updates automatically every few seconds.\n"
+            "• Wait 5–10 seconds after requesting your OTP and tap <b>🔄 Refresh</b>."
+        )
+
+    blocks = ["📬 <b>Latest Received Messages:</b>\n"]
+    for m in messages:
+        otp_line = f"🔑 <b>OTP / Code:</b> <code>{html.escape(m['otp'])}</code>\n" if m["otp"] else ""
+        blocks.append(
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📥 <b>To:</b> <code>{html.escape(m['alias'])}</code> ({time_ago(m['received_at'])})\n"
+            f"📤 <b>From:</b> {html.escape(m['sender'][:50])}\n"
+            f"📝 <b>Subject:</b> {html.escape(m['subject'][:80])}\n"
+            f"{otp_line}"
+            f"💬 <b>Message:</b>\n<pre>{html.escape(m['body'][:400])}</pre>"
+        )
+    return "\n".join(blocks)
+
+
+async def handle_check_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user_gate(update):
+        return
+    user_id = update.effective_user.id
+    emails = await db.get_user_emails(user_id)
+    if not emails:
+        await update.message.reply_text(
+            "You have no active emails. Tap <b>➕ New Email</b> first.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    res_text = await format_cached_inbox([e["email"] for e in emails])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh Again", callback_data="refresh_all")]])
+    await update.message.reply_text(res_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+# --- 4. Delete Email ---
+async def render_delete_menu(user_id: int, page: int = 0):
+    emails = await db.get_user_emails(user_id)
+    if not emails:
+        return "📭 You have no active emails to delete.", None
+
+    total_pages = max(1, (len(emails) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = emails[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
+
+    buttons = [
+        [InlineKeyboardButton(f"🗑️ {item['email']}", callback_data=f"del_ask:{item['id']}")]
+        for item in chunk
+    ]
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"menu_del:{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"menu_del:{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+
+    text = (
+        "🗑️ <b>Delete Active Email</b>\n\n"
+        "Choose which email address you want to deactivate to free up a slot:"
+    )
+    return text, InlineKeyboardMarkup(buttons)
+
+
+async def handle_delete_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user_gate(update):
+        return
+    text, kb = await render_delete_menu(update.effective_user.id, page=0)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+# --- 5. Subscription Info ---
+async def handle_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user_gate(update):
+        return
+    user_id = update.effective_user.id
+    active, max_slots, _ = await db.get_user_quota(user_id)
+    text = (
+        "💎 <b>Subscription Plans (3 up to 50 Slots)</b>\n\n"
+        f"📊 <b>Current Quota:</b> <code>{active}/{max_slots}</code> active emails\n"
+        f"🆔 <b>Your User ID:</b> <code>{user_id}</code>\n\n"
+        "• <b>Free:</b> 3 active emails\n"
+        "• <b>Basic:</b> 10 active emails\n"
+        "• <b>Pro:</b> 25 active emails\n"
+        "• <b>Ultra:</b> 50 active emails\n\n"
+        f"Message {html.escape(ADMIN_USERNAME)} with your User ID to activate a plan."
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+# --- Inline Callbacks ---
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    user_id = user.id
+    data = query.data or ""
+
+    if data == "accept_terms":
+        await db.set_user_agreed(user_id, user.username)
+        await query.edit_message_text(
+            "✅ <b>Terms Accepted!</b>\nYou can now generate temporary emails using the menu below.",
+            parse_mode=ParseMode.HTML,
+        )
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="👇 Choose an option from the keyboard:",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    if data.startswith("gen:"):
+        provider = data.split(":", 1)[1]
+        await create_alias_for_user(query, context, provider)
+
+    elif data.startswith("menu_active:"):
+        page = int(data.split(":")[1])
+        text, kb = await render_active_mails(user_id, page)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    elif data.startswith("menu_del:"):
+        page = int(data.split(":")[1])
+        text, kb = await render_delete_menu(user_id, page)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    elif data == "menu_sub":
+        active, max_slots, _ = await db.get_user_quota(user_id)
+        await query.edit_message_text(
+            "💎 <b>Subscription Plans (3 up to 50 Slots)</b>\n\n"
+            f"📊 <b>Current Quota:</b> <code>{active}/{max_slots}</code>\n"
+            f"🆔 <b>Your User ID:</b> <code>{user_id}</code>\n\n"
+            "• <b>Basic:</b> 10 active emails\n"
+            "• <b>Pro:</b> 25 active emails\n"
+            "• <b>Ultra:</b> 50 active emails\n\n"
+            f"Contact {html.escape(ADMIN_USERNAME)} with your User ID to upgrade.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "refresh_all":
+        emails = await db.get_user_emails(user_id)
+        if not emails:
+            await query.edit_message_text("📭 No active emails found.")
+            return
+        res_text = await format_cached_inbox([e["email"] for e in emails])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh Again", callback_data="refresh_all")]])
+        try:
+            await query.edit_message_text(res_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception:
+            pass
+
+    elif data.startswith("check_one:"):
+        row_id = int(data.split(":")[1])
+        item = await db.get_email_by_id(row_id, user_id)
+        if not item:
+            await query.edit_message_text("⚠️ This email no longer exists.")
+            return
+        res_text = await format_cached_inbox([item["email"]])
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🔄 Refresh This Mail", callback_data=f"check_one:{row_id}")],
+                [InlineKeyboardButton("🗑️ Delete This Mail", callback_data=f"del_ask:{row_id}")],
+                [InlineKeyboardButton("⬅️ Back to Active Mails", callback_data="menu_active:0")],
+            ]
+        )
+        try:
+            await query.edit_message_text(res_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception:
+            pass
+
+    elif data.startswith("del_ask:"):
+        row_id = int(data.split(":")[1])
+        item = await db.get_email_by_id(row_id, user_id)
+        if not item:
+            await query.edit_message_text("📭 Email already deleted.")
+            return
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✅ Confirm Delete", callback_data=f"del_yes:{row_id}"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="menu_del:0"),
+                ]
+            ]
+        )
+        await query.edit_message_text(
+            f"⚠️ <b>Confirm Deletion</b>\n\n"
+            f"Permanently deactivate <code>{html.escape(item['email'])}</code>?\n"
+            "1 slot will be freed immediately.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
+
+    elif data.startswith("del_yes:"):
+        row_id = int(data.split(":")[1])
+        item = await db.get_email_by_id(row_id, user_id)
+        if not item:
+            await query.edit_message_text("📭 Email already deleted.")
+            return
+        await ddg.delete_alias(item["alias_id"], item["token_id"])
+        await db.delete_email_record(row_id, user_id)
+        active, max_slots, _ = await db.get_user_quota(user_id)
+        await query.edit_message_text(
+            f"✅ <b>Deleted:</b> <code>{html.escape(item['email'])}</code>\n"
+            f"📊 <b>Slots Used:</b> <code>{active}/{max_slots}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+# --- Admin Commands ---
+async def addprem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS or len(context.args) != 3:
+        return
+    target_id, slots, days = int(context.args[0]), int(context.args[1]), int(context.args[2])
+    await db.set_subscription(target_id, slots, days)
+    await update.message.reply_text(
+        f"✅ User <code>{target_id}</code> upgraded to <b>{min(50, max(3, slots))} slots</b> for <b>{days} days</b>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def removeprem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS or len(context.args) != 1:
+        return
+    target_id = int(context.args[0])
+    await db.remove_subscription(target_id)
+    await update.message.reply_text(
+        f"✅ User <code>{target_id}</code> reset to <b>3 free slots</b>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS or len(context.args) != 2:
+        return
+    await db.upsert_token(context.args[0], context.args[1])
+    await update.message.reply_text(
+        f"✅ Token <code>{html.escape(context.args[0])}</code> added.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS or len(context.args) != 1:
+        return
+    target_id = int(context.args[0])
+    await db.set_ban_status(target_id, True)
+    await db.log_audit_event(target_id, "", "USER_BANNED", "", f"By admin {update.effective_user.id}")
+    await update.message.reply_text(
+        f"🚫 User <code>{target_id}</code> has been <b>BANNED</b> and all active slots cleared.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS or len(context.args) != 1:
+        return
+    target_id = int(context.args[0])
+    await db.set_ban_status(target_id, False)
+    await update.message.reply_text(
+        f"✅ User <code>{target_id}</code> has been <b>UNBANNED</b>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    if os.path.exists(DB_PATH):
+        with open(DB_PATH, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename=f"backup_{datetime.now(IST).strftime('%Y%m%d_%H%M')}.db",
+                caption="💾 <b>SQLite Database Backup</b>",
+                parse_mode=ParseMode.HTML,
+            )
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    stats = await db.get_global_stats()
+    tokens = await db.get_all_tokens()
+    now = time.time()
+    active_toks = sum(1 for t in tokens if t["is_valid"] == 1 and t["exhausted_until"] <= now)
+    await update.message.reply_text(
+        "📊 <b>Bot Statistics</b>\n\n"
+        f"👥 Total Users: <b>{stats['users']}</b>\n"
+        f"💎 Premium Users: <b>{stats['premium_users']}</b>\n"
+        f"📧 Active Emails: <b>{stats['active_emails']}</b>\n"
+        f"🚫 Banned Users: <b>{stats['banned_users']}</b>\n"
+        f"🔑 Healthy DDG Tokens: <b>{active_toks}/{len(tokens)}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (update.message.text or "").strip()
+    if txt in ("➕ New Email", "+ New Email"):
+        await handle_new_email(update, context)
+    elif txt in ("📧 Active Mails", "Active Mails"):
+        await handle_active_mails(update, context)
+    elif txt in ("📥 Check Inbox", "Check Inbox"):
+        await handle_check_inbox(update, context)
+    elif txt in ("🗑️ Delete Email", "Delete Email"):
+        await handle_delete_menu(update, context)
+    elif txt in ("💎 Subscription", "Subscription"):
+        await handle_subscription(update, context)
+    else:
+        if not await check_user_gate(update):
+            return
+        reply = await ai_client.answer_support_query(txt)
+        if reply:
+            await update.message.reply_text(
+                f"🤖 {html.escape(reply)}", parse_mode=ParseMode.HTML
+            )
+
+
+async def post_init(application: Application):
+    global imap_task
+    await db.init_db()
+    raw_tokens = os.getenv("DDG_TOKENS", "")
+    for pair in raw_tokens.split(","):
+        if ":" in pair:
+            name, tok = pair.split(":", 1)
+            if name.strip() and tok.strip():
+                await db.upsert_token(name.strip(), tok.strip())
+    imap_task = asyncio.create_task(run_imap_background_loop(application, db))
+
+
+async def post_shutdown(application: Application):
+    if imap_task:
+        imap_task.cancel()
+    await ai_client.close()
+    await ddg.http.aclose()
+    await db.close()
+
+
+def main():
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(256)
+        .rate_limiter(AIORateLimiter(max_retries=3))
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("addprem", addprem_cmd))
+    app.add_handler(CommandHandler("removeprem", removeprem_cmd))
+    app.add_handler(CommandHandler("addtoken", addtoken_cmd))
+    app.add_handler(CommandHandler("ban", ban_cmd))
+    app.add_handler(CommandHandler("unban", unban_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+
+    print("Polished Temp-Mail Bot is running...")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
+    
