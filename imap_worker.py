@@ -6,12 +6,25 @@ import email
 import asyncio
 import hashlib
 from email.header import decode_header
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Set, Optional
 from bs4 import BeautifulSoup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, CopyTextButton
 from telegram.constants import ParseMode
 from telegram.ext import Application
+
 from database import Database
+from ai_helper import UniversalAIClient
+
+IST = timezone(timedelta(hours=5, minutes=30))
+LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "").strip()
+
+BLOCKED_DOMAINS = (
+    ".gov.in", ".nic.in", ".gov", ".mil",
+    "sbi.co.in", "hdfcbank.com", "icicibank.com", "axisbank.com",
+    "kotak.com", "paytm.com", "phonepe.com", "razorpay.com",
+    "binance.com", "coindcx.com", "wazirx.com", "paypal.com",
+)
 
 
 def _decode_mime(s: Optional[str]) -> str:
@@ -26,7 +39,15 @@ def _decode_mime(s: Optional[str]) -> str:
     return "".join(out)
 
 
-def _extract_body(msg: email.message.Message) -> str:
+def _is_high_risk_sender(from_header: str) -> bool:
+    match = re.search(r"@([\w\.-]+)", from_header.lower())
+    if not match:
+        return False
+    domain = match.group(1)
+    return any(domain == b or domain.endswith(b) for b in BLOCKED_DOMAINS)
+
+
+def _extract_body_and_link(msg: email.message.Message) -> tuple[str, str]:
     plain_text, html_text = "", ""
     if msg.is_multipart():
         for part in msg.walk():
@@ -49,18 +70,35 @@ def _extract_body(msg: email.message.Message) -> str:
             else:
                 plain_text = raw
 
-    if plain_text.strip():
-        clean = plain_text
-    elif html_text.strip():
+    verify_link = ""
+    if html_text.strip():
         soup = BeautifulSoup(html_text, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            label = a.get_text(" ", strip=True).lower()
+            if href.startswith("http") and any(
+                k in label or k in href.lower()
+                for k in ("verify", "confirm", "activate", "token=", "code=")
+            ):
+                verify_link = href
+                break
         for tag in soup(["script", "style", "head"]):
             tag.decompose()
-        clean = soup.get_text(separator="\n")
+        clean = plain_text if plain_text.strip() else soup.get_text(separator="\n")
+    elif plain_text.strip():
+        clean = plain_text
+        m_link = re.search(
+            r"https?://[^\s<>\"']+(?:verify|confirm|activate|token)[^\s<>\"']*",
+            plain_text,
+            re.I,
+        )
+        if m_link:
+            verify_link = m_link.group(0)
     else:
         clean = "(Empty body)"
 
     lines = [line.strip() for line in clean.splitlines() if line.strip()]
-    return "\n".join(lines)[:900]
+    return "\n".join(lines)[:900], verify_link
 
 
 def _extract_otp(subject: str, body: str) -> str:
@@ -80,7 +118,7 @@ def _extract_otp(subject: str, body: str) -> str:
 
 class PersistentImapPoller:
     def __init__(self):
-        self.host = os.getenv("IMAP_HOST", "outlook.office365.com")
+        self.host = os.getenv("IMAP_HOST", "imap.zoho.in")
         self.user = os.getenv("IMAP_USER", "")
         self.password = os.getenv("IMAP_PASS", "")
         self.conn: Optional[imaplib.IMAP4_SSL] = None
@@ -109,9 +147,12 @@ class PersistentImapPoller:
         since_date = (datetime.utcnow() - timedelta(days=1)).strftime("%d-%b-%Y")
         new_items: List[Dict[str, str]] = []
 
-        for folder in ["INBOX", "Junk"]:
-            status, _ = self.conn.select(folder, readonly=True)
-            if status != "OK":
+        for folder in ["INBOX", "Junk", "Spam"]:
+            try:
+                status, _ = self.conn.select(folder, readonly=True)
+                if status != "OK":
+                    continue
+            except Exception:
                 continue
 
             status, data = self.conn.search(None, f'(SINCE "{since_date}")')
@@ -131,7 +172,6 @@ class PersistentImapPoller:
 
                 msg = email.message_from_bytes(raw_bytes)
                 raw_headers = "\n".join(f"{k}: {v}" for k, v in msg.items()).lower()
-
                 matched_alias = next(
                     (alias for alias in active_aliases if alias in raw_headers), None
                 )
@@ -140,7 +180,7 @@ class PersistentImapPoller:
 
                 subject = _decode_mime(msg.get("Subject", "(No Subject)"))
                 sender = _decode_mime(msg.get("From", "Unknown"))
-                body = _extract_body(msg)
+                body, verify_link = _extract_body_and_link(msg)
                 otp = _extract_otp(subject, body)
 
                 new_items.append(
@@ -151,6 +191,7 @@ class PersistentImapPoller:
                         "subject": subject,
                         "otp": otp,
                         "body": body,
+                        "verify_link": verify_link,
                     }
                 )
 
@@ -160,56 +201,160 @@ class PersistentImapPoller:
         return new_items
 
 
+async def _send_audit_log(app: Application, text: str):
+    if not LOG_CHANNEL_ID:
+        return
+    try:
+        await app.bot.send_message(
+            chat_id=int(LOG_CHANNEL_ID),
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        print(f"[Audit Log Error] {e}")
+
+
 async def run_imap_background_loop(app: Application, db: Database):
     poller = PersistentImapPoller()
+    ai_client = UniversalAIClient()
     cleanup_counter = 0
 
-    while True:
-        try:
-            alias_map = await db.get_all_active_alias_map()
-            if alias_map:
-                items = await asyncio.to_thread(
-                    poller.poll_once_sync, set(alias_map.keys())
-                )
-                for item in items:
-                    inserted = await db.save_inbox_message(
-                        msg_uid=item["uid"],
-                        alias=item["alias"],
-                        sender=item["sender"],
-                        subject=item["subject"],
-                        otp=item["otp"],
-                        body=item["body"],
+    try:
+        while True:
+            try:
+                alias_map = await db.get_all_active_alias_map()
+                if alias_map:
+                    items = await asyncio.to_thread(
+                        poller.poll_once_sync, set(alias_map.keys())
                     )
-                    target_user_id = alias_map.get(item["alias"])
-                    if inserted and target_user_id:
-                        otp_line = (
-                            f"🔑 <b>OTP / Code:</b> <code>{html.escape(item['otp'])}</code>\n"
-                            if item["otp"]
-                            else ""
-                        )
-                        text = (
-                            "🔔 <b>New Email / OTP Received!</b>\n\n"
-                            f"📧 <b>To:</b> <code>{html.escape(item['alias'])}</code>\n"
-                            f"👤 <b>From:</b> {html.escape(item['sender'][:50])}\n"
-                            f"📝 <b>Subject:</b> {html.escape(item['subject'][:80])}\n"
-                            f"{otp_line}"
-                            f"💬 <b>Message:</b>\n<pre>{html.escape(item['body'][:450])}</pre>"
-                        )
-                        asyncio.create_task(
-                            app.bot.send_message(
-                                chat_id=target_user_id,
-                                text=text,
-                                parse_mode=ParseMode.HTML,
+                    for item in items:
+                        target_user_id = alias_map.get(item["alias"])
+                        if not target_user_id:
+                            continue
+
+                        now_ist = datetime.now(IST).strftime("%d-%b-%Y %I:%M:%S %p IST")
+
+                        if _is_high_risk_sender(item["sender"]):
+                            await db.log_audit_event(
+                                target_user_id, "", "BLOCKED_DOMAIN", item["alias"], item["sender"]
                             )
+                            asyncio.create_task(
+                                app.bot.send_message(
+                                    chat_id=target_user_id,
+                                    text=(
+                                        "⛔ <b>Blocked High-Risk Email</b>\n\n"
+                                        "Verification codes from banking, financial, crypto, or government portals "
+                                        "are strictly prohibited under our Terms of Use."
+                                    ),
+                                    parse_mode=ParseMode.HTML,
+                                )
+                            )
+                            asyncio.create_task(
+                                _send_audit_log(
+                                    app,
+                                    f"🚨 #BLOCKED_DOMAIN | #ID_{target_user_id}\n"
+                                    f"🆔 <b>User ID:</b> <code>{target_user_id}</code>\n"
+                                    f"📧 <b>Alias:</b> <code>{html.escape(item['alias'])}</code>\n"
+                                    f"📤 <b>From:</b> {html.escape(item['sender'][:60])}\n"
+                                    f"🕒 <b>Time:</b> {now_ist}",
+                                )
+                            )
+                            continue
+
+                        ai_info = await ai_client.analyze_email(item["subject"], item["body"])
+                        if not item["otp"] and ai_info.get("otp"):
+                            item["otp"] = ai_info["otp"]
+
+                        inserted = await db.save_inbox_message(
+                            msg_uid=item["uid"],
+                            alias=item["alias"],
+                            sender=item["sender"],
+                            subject=item["subject"],
+                            otp=item["otp"],
+                            body=item["body"],
                         )
 
-            cleanup_counter += 1
-            if cleanup_counter >= 450:
-                await db.purge_old_messages(86400)
-                cleanup_counter = 0
+                        if inserted:
+                            await db.log_audit_event(
+                                target_user_id, "", "OTP_RECEIVED", item["alias"], item["sender"]
+                            )
 
-        except Exception as exc:
-            print(f"[IMAP Worker Warning] {exc}")
-            poller.conn = None
+                            otp_line = (
+                                f"🔑 <b>OTP / Code:</b> <code>{html.escape(item['otp'])}</code>\n"
+                                if item["otp"]
+                                else ""
+                            )
 
-        await asyncio.sleep(8)
+                            ai_note = ""
+                            if ai_info.get("warning"):
+                                ai_note = f"\n⚠️ <b>Security Alert:</b> {html.escape(ai_info['warning'])}"
+                            elif ai_info.get("summary"):
+                                ai_note = f"\n🤖 <b>Summary:</b> <i>{html.escape(ai_info['summary'])}</i>"
+
+                            text = (
+                                "📩 <b>New Email / OTP Received!</b>\n\n"
+                                f"📥 <b>To:</b> <code>{html.escape(item['alias'])}</code>\n"
+                                f"📤 <b>From:</b> {html.escape(item['sender'][:50])}\n"
+                                f"📝 <b>Subject:</b> {html.escape(item['subject'][:80])}\n"
+                                f"{otp_line}"
+                                f"💬 <b>Message:</b>\n<pre>{html.escape(item['body'][:400])}</pre>"
+                                f"{ai_note}"
+                            )
+
+                            btn_rows = []
+                            if item["otp"]:
+                                btn_rows.append(
+                                    [
+                                        InlineKeyboardButton(
+                                            f"📋 Copy OTP: {item['otp']}",
+                                            copy_text=CopyTextButton(text=item["otp"]),
+                                        )
+                                    ]
+                                )
+                            if item["verify_link"]:
+                                btn_rows.append(
+                                    [
+                                        InlineKeyboardButton(
+                                            "🔗 Open Verification Link",
+                                            url=item["verify_link"],
+                                        )
+                                    ]
+                                )
+                            btn_rows.append(
+                                [InlineKeyboardButton("🔄 Check Inbox", callback_data="refresh_all")]
+                            )
+
+                            asyncio.create_task(
+                                app.bot.send_message(
+                                    chat_id=target_user_id,
+                                    text=text,
+                                    parse_mode=ParseMode.HTML,
+                                    reply_markup=InlineKeyboardMarkup(btn_rows),
+                                    disable_web_page_preview=True,
+                                )
+                            )
+
+                            asyncio.create_task(
+                                _send_audit_log(
+                                    app,
+                                    f"📩 #OTP_RECEIVED | #ID_{target_user_id}\n"
+                                    f"🆔 <b>User ID:</b> <code>{target_user_id}</code>\n"
+                                    f"📧 <b>Alias:</b> <code>{html.escape(item['alias'])}</code>\n"
+                                    f"📤 <b>From:</b> {html.escape(item['sender'][:60])}\n"
+                                    f"🕒 <b>Time:</b> {now_ist}",
+                                )
+                            )
+
+                cleanup_counter += 1
+                if cleanup_counter >= 450:
+                    await db.purge_old_messages(86400)
+                    cleanup_counter = 0
+
+            except Exception as exc:
+                print(f"[IMAP Worker Warning] {exc}")
+                poller.conn = None
+
+            await asyncio.sleep(6)
+    finally:
+        await ai_client.close()
