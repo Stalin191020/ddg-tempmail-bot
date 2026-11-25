@@ -7,7 +7,7 @@ from database import Database
 
 
 class DuckAliasClient:
-    BASE_URL = "[https://quack.duckduckgo.com/api/email](https://quack.duckduckgo.com/api/email)"
+    BASE_URL = "https://quack.duckduckgo.com/api/email"
 
     def __init__(self, db: Database):
         self.db = db
@@ -19,8 +19,8 @@ class DuckAliasClient:
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/131.0.0.0 Safari/537.36"
                 ),
-                "Origin": "[https://duckduckgo.com](https://duckduckgo.com)",
-                "Referer": "[https://duckduckgo.com/](https://duckduckgo.com/)",
+                "Origin": "https://duckduckgo.com",
+                "Referer": "https://duckduckgo.com/",
             },
         )
 
@@ -40,10 +40,10 @@ class DuckAliasClient:
 
         for tok in healthy:
             token_id = tok["token_id"]
-            bearer = tok["bearer_token"]
+            bearer = tok["bearer_token"].strip()
             try:
                 resp = await self.http.post(
-                    f"{self.BASE_URL}/addresses",
+                    "https://quack.duckduckgo.com/api/email/addresses",
                     headers={"Authorization": f"Bearer {bearer}"},
                 )
                 if resp.status_code in (200, 201):
@@ -116,8 +116,8 @@ class DuckAliasClient:
             return
         try:
             await self.http.delete(
-                f"{self.BASE_URL}/addresses/{alias_id}",
-                headers={"Authorization": f"Bearer {tok['bearer_token']}"},
+                f"https://quack.duckduckgo.com/api/email/addresses/{alias_id}",
+                headers={"Authorization": f"Bearer {tok['bearer_token'].strip()}"},
             )
         except Exception:
             pass
