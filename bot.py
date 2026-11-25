@@ -531,3 +531,5 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Admin Commands ---
 async def addprem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS or l
+if __name__ == "__main__":
+    main()
