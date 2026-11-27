@@ -71,14 +71,19 @@ def _extract_body_and_link(msg: email.message.Message) -> tuple[str, str]:
                 plain_text = raw
 
     verify_link = ""
+    bad_words = ("privacy", "terms", "policy", "unsubscribe", "facebook", "instagram", "twitter", "youtube", "help", "support")
+    good_words = ("verify", "confirm", "login", "signin", "magic", "auth", "token", "activate", "reset", "redirect")
+
     if html_text.strip():
         soup = BeautifulSoup(html_text, "html.parser")
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
+            low_href = href.lower()
             label = a.get_text(" ", strip=True).lower()
-            if href.startswith("http") and any(
-                k in label or k in href.lower()
-                for k in ("verify", "confirm", "activate", "token=", "code=")
+            if (
+                href.startswith("http")
+                and not any(b in low_href or b in label for b in bad_words)
+                and any(k in label or k in low_href for k in ("verify", "confirm", "activate", "token=", "code=", "magic", "login"))
             ):
                 verify_link = href
                 break
@@ -88,7 +93,7 @@ def _extract_body_and_link(msg: email.message.Message) -> tuple[str, str]:
     elif plain_text.strip():
         clean = plain_text
         m_link = re.search(
-            r"https?://[^\s<>\"']+(?:verify|confirm|activate|token)[^\s<>\"']*",
+            r"https?://[^\s<>\"']+(?:verify|confirm|activate|token|magic)[^\s<>\"']*",
             plain_text,
             re.I,
         )
@@ -96,6 +101,11 @@ def _extract_body_and_link(msg: email.message.Message) -> tuple[str, str]:
             verify_link = m_link.group(0)
     else:
         clean = "(Empty body)"
+
+    if verify_link:
+        low_url = verify_link.lower()
+        if any(b in low_url for b in bad_words) or not any(g in low_url for g in good_words):
+            verify_link = ""
 
     lines = [line.strip() for line in clean.splitlines() if line.strip()]
     return "\n".join(lines)[:900], verify_link
@@ -116,8 +126,6 @@ def _extract_otp(subject: str, body: str) -> str:
         if num not in {"2024", "2025", "2026", "2027"}:
             return num
     return ""
-
-
 class PersistentImapPoller:
     def __init__(self):
         self.host = os.getenv("IMAP_HOST", "imap.zoho.in")
@@ -360,3 +368,4 @@ async def run_imap_background_loop(app: Application, db: Database):
             await asyncio.sleep(6)
     finally:
         await ai_client.close()
+        
