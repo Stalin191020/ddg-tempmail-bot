@@ -104,16 +104,16 @@ class UniversalAIClient:
             pass
         return result
 
-    async def answer_support_query(self, user_question: str) -> str:
+        async def answer_support_query(self, user_question: str) -> str:
         if not self.is_enabled:
             return ""
         sys_prompt = (
             "You are the friendly support assistant for a Telegram Temp-Mail & OTP Bot. "
             "Reply in under 3 short lines in simple Hinglish/English. "
+            "Use PLAIN TEXT ONLY—never use ** or * or any markdown formatting. "
             "Guide users to use '➕ New Email' and '📥 Check Inbox'. "
-            "Banking, crypto, and government accounts are strictly prohibited."
+            "If a user asks if a number is an OTP, tell them to check the email text—some sites send a Verification Link instead of an OTP, so ignore numbers inside URLs. "
+            "Only mention that banking, crypto, and government accounts are prohibited if the user asks about them."
         )
-        return await self._chat(sys_prompt, user_question[:300], 400)
-
-    async def close(self):
-        await self.http.aclose()
+        reply = await self._chat(sys_prompt, user_question[:300], 400)
+        return reply.replace("**", "").replace("*", "").strip()
