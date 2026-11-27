@@ -41,7 +41,6 @@ class UniversalAIClient:
         except Exception as e:
             print(f"[AI ListModels Exception] {e}")
 
-        # Newest models pehle try karne ke liye reverse sort
         candidates.sort(reverse=True)
         return candidates
 
@@ -104,7 +103,7 @@ class UniversalAIClient:
             pass
         return result
 
-        async def answer_support_query(self, user_question: str) -> str:
+    async def answer_support_query(self, user_question: str) -> str:
         if not self.is_enabled:
             return ""
         sys_prompt = (
@@ -117,3 +116,6 @@ class UniversalAIClient:
         )
         reply = await self._chat(sys_prompt, user_question[:300], 400)
         return reply.replace("**", "").replace("*", "").strip()
+
+    async def close(self):
+        await self.http.aclose()
