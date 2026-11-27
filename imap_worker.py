@@ -102,7 +102,9 @@ def _extract_body_and_link(msg: email.message.Message) -> tuple[str, str]:
 
 
 def _extract_otp(subject: str, body: str) -> str:
-    combined = f"{subject}\n{body}"
+    clean_body = re.sub(r"https?://\S+", " ", body)
+    combined = f"{subject}\n{clean_body}"
+
     m = re.search(
         r"(?:otp|code|pin|verification|verify|passcode)[^\d]{0,25}(\b\d{4,8}\b)",
         combined,
