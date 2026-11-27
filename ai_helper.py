@@ -78,30 +78,7 @@ class UniversalAIClient:
         return ""
 
     async def analyze_email(self, subject: str, body: str) -> Dict[str, str]:
-        result = {"otp": "", "summary": "", "warning": ""}
-        if not self.is_enabled:
-            return result
-
-        sys_prompt = (
-            "You are an email security & OTP parser. Reply ONLY in valid JSON "
-            'with exact keys: {"otp": "", "summary": "", "warning": ""}. '
-            "otp: verification code if present (never extract numbers from URLs), else empty. "
-            "summary: max 15-word plain English summary. "
-            "warning: short phishing warning only if suspicious, else empty."
-        )
-        raw = await self._chat(sys_prompt, f"Subject: {subject[:120]}\nBody:\n{body[:1200]}", 400)
-        if not raw:
-            return result
-
-        clean = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        try:
-            parsed = json.loads(clean)
-            result["otp"] = str(parsed.get("otp", "")).strip()
-            result["summary"] = str(parsed.get("summary", "")).strip()
-            result["warning"] = str(parsed.get("warning", "")).strip()
-        except Exception:
-            pass
-        return result
+        return {"otp": "", "summary": "", "warning": ""}
 
     async def answer_support_query(self, user_question: str) -> str:
         if not self.is_enabled:
