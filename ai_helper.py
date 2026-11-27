@@ -1,7 +1,7 @@
 import os
 import json
 import httpx
-from typing import Dict
+from typing import Dict, List
 
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
 
@@ -9,54 +9,73 @@ AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
 class UniversalAIClient:
     def __init__(self):
         self.http = httpx.AsyncClient(timeout=20.0)
-        self.cached_model = ""
+        self.working_model = ""
+        self.failed_models = set()
 
     @property
     def is_enabled(self) -> bool:
         return bool(AI_API_KEY)
 
-    async def _resolve_gemini_model(self) -> str:
-        if self.cached_model:
-            return self.cached_model
+    async def _get_candidate_models(self) -> List[str]:
+        if self.working_model:
+            return [self.working_model]
+
         url = f"https://generativelanguage.googleapis.com/v1beta/models?key={AI_API_KEY}"
+        candidates = []
         try:
             resp = await self.http.get(url)
             if resp.status_code == 200:
-                models = resp.json().get("models", [])
-                for m in models:
+                for m in resp.json().get("models", []):
                     name = m.get("name", "").replace("models/", "")
                     methods = m.get("supportedGenerationMethods", [])
-                    if "flash" in name and "generateContent" in methods:
-                        self.cached_model = name
-                        print(f"[AI Auto-Selected Model] {name}")
-                        return name
+                    if (
+                        "flash" in name
+                        and "generateContent" in methods
+                        and "tts" not in name
+                        and "image" not in name
+                        and name not in self.failed_models
+                    ):
+                        candidates.append(name)
+            else:
+                print(f"[AI ListModels Error {resp.status_code}] {resp.text[:200]}")
         except Exception as e:
-            print(f"[AI Model Discovery Error] {e}")
-        return "gemini-1.5-flash"
+            print(f"[AI ListModels Exception] {e}")
+
+        # Newest models pehle try karne ke liye reverse sort
+        candidates.sort(reverse=True)
+        return candidates
 
     async def _chat(self, system_prompt: str, user_prompt: str, max_tokens: int = 500) -> str:
         if not self.is_enabled:
+            print("[AI] AI_API_KEY missing!")
             return ""
 
-        model = await self._resolve_gemini_model()
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={AI_API_KEY}"
+        candidates = await self._get_candidate_models()
+        if not candidates:
+            print("[AI] No working flash models found!")
+            return ""
+
         payload = {
             "systemInstruction": {"parts": [{"text": system_prompt}]},
             "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens},
         }
 
-        try:
-            resp = await self.http.post(url, json=payload)
-            if resp.status_code == 200:
-                data = resp.json()
-                parts = data["candidates"][0]["content"]["parts"]
-                return "".join(p.get("text", "") for p in parts).strip()
-            else:
-                self.cached_model = ""
-                print(f"[AI Error {resp.status_code}] {resp.text[:250]}")
-        except Exception as exc:
-            print(f"[AI Exception] {exc}")
+        for model in candidates[:5]:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={AI_API_KEY}"
+            try:
+                resp = await self.http.post(url, json=payload)
+                if resp.status_code == 200:
+                    self.working_model = model
+                    print(f"[AI Working Model Locked] {model}")
+                    parts = resp.json()["candidates"][0]["content"]["parts"]
+                    return "".join(p.get("text", "") for p in parts).strip()
+                else:
+                    print(f"[AI Skip {model} -> {resp.status_code}] {resp.text[:150]}")
+                    self.failed_models.add(model)
+            except Exception as exc:
+                print(f"[AI Exception {model}] {exc}")
+
         return ""
 
     async def analyze_email(self, subject: str, body: str) -> Dict[str, str]:
